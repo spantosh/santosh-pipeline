@@ -1,0 +1,98 @@
+name: santosh-pipeline
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - run: go vet ./...
+      - run: go test -v ./...
+      - run: gofmt -l .
+  dockerfile-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hadolint Dockerfile
+        run: docker run --rm -i hadolint/hadolint hadolint --failure-threshold=warning - < Dockerfile
+  dep-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          $(go env GOPATH)/bin/govulncheck ./...
+  build:
+    needs: [quality, dockerfile-lint, dep-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push image
+        run: |
+          docker build -t ghcr.io/spantosh/santosh-pipeline:${{ github.sha }} .
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/spantosh/santosh-pipeline:${{ github.sha }}
+  security-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy scan, fail on CRITICAL
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker pull ghcr.io/spantosh/santosh-pipeline:${{ github.sha }}
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --severity CRITICAL --exit-code 1 --ignore-unfixed ghcr.io/spantosh/santosh-pipeline:${{ github.sha }}
+  deploy-demo:
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish demo page to gh-pages
+        run: |
+          cat > index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>santosh-pipeline demo</title>
+            <style>
+              body { font-family: system-ui, sans-serif; background:#0d1117; color:#e6edf3; display:grid; place-items:center; min-height:100vh; margin:0 }
+              main { text-align:center }
+              .ok { color:#3fb950; font-size:1.6rem; font-weight:700; margin-bottom:.5rem }
+              a { color:#58a6ff }
+              code { color:#ffa657 }
+            </style>
+          </head>
+          <body>
+            <main>
+              <div class="ok">santosh-pipeline demo</div>
+              <p>PASSED</p>
+              <p>run #${{ github.run_number }} &middot; ${{ github.ref_name }} &middot; <code>${{ github.sha }}</code></p>
+              <p>quality &middot; hadolint &middot; vuln-check &middot; trivy &middot; deploy</p>
+              <p><a href="https://github.com/spantosh/santosh-pipeline">source</a></p>
+            </main>
+          </body>
+          </html>
+          EOF
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan gh-pages -q
+          git rm -rf . --quiet 2>/dev/null || true
+          git add .
+          git commit -q -m "deploy demo run #${{ github.run_number }}" || true
+          git push -qf https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/spantosh/santosh-pipeline.git gh-pages
